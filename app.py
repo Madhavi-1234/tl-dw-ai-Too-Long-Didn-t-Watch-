@@ -1,23 +1,24 @@
 import streamlit as st
-from dotenv import load_dotenv
 import os
+import glob
+from dotenv import load_dotenv
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
-
 from faster_whisper import WhisperModel
 import yt_dlp
-import glob
 from urllib.parse import urlparse, parse_qs
-
 
 # -----------------------------
 # ENV + GEMINI
 # -----------------------------
 load_dotenv()
-
 genai.configure(api_key=os.getenv("GEMINI_KEY"))
 model = genai.GenerativeModel("gemini-2.5-flash")
 
+# -----------------------------
+# LOAD WHISPER ONCE (IMPORTANT)
+# -----------------------------
+whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
 
 # -----------------------------
 # PROMPT
@@ -25,15 +26,14 @@ model = genai.GenerativeModel("gemini-2.5-flash")
 prompt = """
 You are a helpful YouTube assistant.
 
-Summarize the transcript clearly:
+Summarize the transcript:
 - Bullet points
 - Key insights
-- Max 250 words
+- Keep it under 250 words
 """
 
-
 # -----------------------------
-# VIDEO ID (SAFE FIX)
+# VIDEO ID
 # -----------------------------
 def extract_video_id(url):
     try:
@@ -44,88 +44,97 @@ def extract_video_id(url):
     except:
         return None
 
-
 # -----------------------------
-# TRANSCRIPT FUNCTION (ROBUST)
+# TRANSCRIPT FIRST
 # -----------------------------
-def get_transcript_details(youtube_video_url):
-
-    # -------- TRY YOUTUBE API --------
+def get_transcript(video_id):
     try:
-        video_id = extract_video_id(youtube_video_url)
-
-        if video_id:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-            return " ".join([i["text"] for i in transcript_list])
-
-    except Exception:
-        st.warning("Transcript API failed → using Whisper fallback")
-
-    # -------- WHISPER FALLBACK --------
-    try:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': 'audio.%(ext)s',
-            'quiet': True
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([youtube_video_url])
-
-        # safer file detection
-        audio_files = glob.glob("audio.*")
-
-        if not audio_files:
-            return "❌ Audio download failed"
-
-        audio_file = audio_files[0]
-
-        # Whisper
-        whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
-
-        segments, info = whisper_model.transcribe(audio_file)
-
-        return " ".join([seg.text for seg in segments])
-
-    except Exception as e:
-        return f"❌ Whisper failed: {str(e)}"
-
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        return " ".join([t["text"] for t in transcript])
+    except:
+        return None
 
 # -----------------------------
-# GEMINI
+# WHISPER FALLBACK
 # -----------------------------
-def get_gemini_content(transcript_text):
+def whisper_transcribe(url):
 
-    if not transcript_text:
-        return "❌ No transcript found"
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': 'audio.%(ext)s',
+        'quiet': True,
+        'noplaylist': True
+    }
 
-    full_prompt = prompt + "\n\nTranscript:\n" + transcript_text
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
 
-    response = model.generate_content(full_prompt)
+    audio_files = glob.glob("audio.*")
 
+    if not audio_files:
+        return None
+
+    audio_file = audio_files[0]
+
+    segments, _ = whisper_model.transcribe(audio_file)
+
+    text = " ".join([seg.text for seg in segments])
+
+    # cleanup
+    os.remove(audio_file)
+
+    return text
+
+# -----------------------------
+# MAIN PIPELINE (SMART BRAIN)
+# -----------------------------
+def get_text_from_video(url):
+
+    video_id = extract_video_id(url)
+
+    # STEP 1: transcript
+    if video_id:
+        text = get_transcript(video_id)
+        if text:
+            return text
+
+    st.info("Transcript not available → using Whisper...")
+
+    # STEP 2: whisper fallback
+    return whisper_transcribe(url)
+
+# -----------------------------
+# GEMINI SUMMARY
+# -----------------------------
+def get_summary(text):
+
+    if not text:
+        return "No transcript found"
+
+    response = model.generate_content(prompt + "\n\nTranscript:\n" + text)
     return response.text
-
 
 # -----------------------------
 # STREAMLIT UI
 # -----------------------------
-st.title("🎥 YouTube Insight Bot")
+st.title("🎥 YouTube AI Insight Bot")
 
-youtube_link = st.text_input("Enter YouTube URL")
+url = st.text_input("Enter YouTube URL")
 
 if st.button("Generate Insights"):
 
-    if not youtube_link:
+    if not url:
         st.error("Please enter URL")
     else:
 
-        with st.spinner("Processing video... ⏳"):
-            transcript_text = get_transcript_details(youtube_link)
+        with st.spinner("Processing video..."):
 
-        if "❌" in transcript_text:
-            st.error(transcript_text)
-        else:
-            summary = get_gemini_content(transcript_text)
+            transcript = get_text_from_video(url)
 
-            st.markdown("## 📌 Insights")
-            st.write(summary)
+            if not transcript:
+                st.error("Failed to process video")
+            else:
+                summary = get_summary(transcript)
+
+                st.subheader("📌 Insights")
+                st.write(summary)
